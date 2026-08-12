@@ -32,6 +32,74 @@ variable "name" {
   }
 }
 
+variable "kubernetes_version" {
+  description = <<-EOT
+    Kubernetes minor version for the EKS cluster.
+
+    1.36 is chosen because the whole chain was verified against current
+    documentation: EKS standard support, Karpenter >= 1.13 required (1.14.0 is
+    current), managed add-ons published, and AWS's own Karpenter getting-started
+    guide currently runs this exact pair. 1.35 is a supported fallback and is a
+    single-variable change.
+
+    Verify availability in your region before deploying:
+      aws eks describe-cluster-versions --region <region>
+  EOT
+  type        = string
+  default     = "1.36"
+
+  validation {
+    condition     = can(regex("^1\\.(3[4-9]|[4-9][0-9])$", var.kubernetes_version))
+    error_message = "kubernetes_version must be 1.34 or later. Earlier versions are in extended support, which costs 6x more per cluster-hour."
+  }
+}
+
+variable "endpoint_public_access_cidrs" {
+  description = <<-EOT
+    CIDR blocks allowed to reach the public EKS API server endpoint.
+
+    Deliberately has no default. The upstream default is 0.0.0.0/0, and a
+    configuration whose secure operation depends on the operator remembering to
+    override an insecure default is not secure.
+
+    Normally this is your own address as a /32:
+      echo "[\"$(curl -s https://checkip.amazonaws.com)/32\"]"
+
+    Authentication is still IAM — a public endpoint is not an unauthenticated
+    endpoint. This is defence in depth, and it is the layer that still stands if
+    credentials leak.
+  EOT
+  type        = list(string)
+
+  validation {
+    condition     = length(var.endpoint_public_access_cidrs) > 0
+    error_message = "At least one CIDR block is required. To have no public endpoint at all, set endpoint_public_access = false instead."
+  }
+
+  validation {
+    condition     = alltrue([for c in var.endpoint_public_access_cidrs : can(cidrhost(c, 0))])
+    error_message = "Every entry must be a valid CIDR block, for example 203.0.113.10/32."
+  }
+
+  validation {
+    condition     = !contains(var.endpoint_public_access_cidrs, "0.0.0.0/0")
+    error_message = "0.0.0.0/0 exposes the Kubernetes API server to the entire internet. Pass an explicit allowlist. If you genuinely need this, change it here deliberately rather than inheriting it."
+  }
+}
+
+variable "endpoint_public_access" {
+  description = <<-EOT
+    Whether the EKS API server has a public endpoint.
+
+    True for this proof of concept: Terraform and kubectl run from a developer
+    workstation, and a private-only endpoint would require a VPN, a bastion or
+    an SSM tunnel — infrastructure that demonstrates nothing about Karpenter.
+    Production inverts this; see the README.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "vpc_cidr" {
   description = <<-EOT
     CIDR block for the VPC. A /16 gives the private subnets room to be /20 each,
