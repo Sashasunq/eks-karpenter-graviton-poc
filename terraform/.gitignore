@@ -1,0 +1,31 @@
+# Terraform state — contains cluster CA data, resource identifiers and account context.
+# Never committed. See README "Terraform state".
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Saved plans can contain resolved values, including sensitive ones.
+*.tfplan
+tfplan
+plan.out
+
+# Variable files may carry account-specific values.
+*.tfvars
+*.tfvars.json
+!example.tfvars
+
+# Provider and module downloads. The lock file IS committed; this directory is not.
+.terraform/
+.terraform.tfstate.lock.info
+
+# Crash logs can contain state fragments.
+crash.log
+crash.*.log
+
+# Credentials — none of these should exist here, and if one does it must not be committed.
+.aws/
+credentials
+*.pem
+*.key
+kubeconfig
+kubeconfig.*
