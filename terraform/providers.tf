@@ -1,6 +1,18 @@
 provider "aws" {
   region = var.region
 
+  # The guardrail that matters most in this file.
+  #
+  # Credentials come from the standard AWS chain, so the account being deployed
+  # into is decided by whatever happened to be loaded — a shared `[default]`
+  # profile, a stale exported session, a forgotten AWS_PROFILE. Getting that
+  # wrong creates a VPC, an EKS cluster and a NAT Gateway somewhere they do not
+  # belong, and on a production account the consequence is not just a bill.
+  #
+  # With this set, the provider verifies the caller's account before creating
+  # anything and stops if it is not one you named.
+  allowed_account_ids = var.allowed_account_ids
+
   # No profile, no access keys, no account ID anywhere in this repository.
   # Credentials come from the standard AWS provider chain — environment
   # variables, an SSO session, an assumed role, or an instance/container role.

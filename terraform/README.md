@@ -59,6 +59,9 @@ You also need AWS credentials with permission to create VPC, EC2, IAM and EKS re
 This configuration uses the **standard AWS provider credential chain**. It contains no profile name,
 no access key, and no account ID.
 
+**Set `AWS_PROFILE` explicitly.** Relying on a `[default]` profile is how infrastructure ends up in
+the wrong account; `allowed_account_ids` is the backstop, not the plan.
+
 Any of these work:
 
 ```bash
@@ -75,6 +78,8 @@ aws sts get-caller-identity
 
 **Why no static keys.** A long-lived access key must be stored somewhere, must be rotated by
 someone, and has indefinite blast radius from anywhere. Short-lived credentials expire on their own.
+A static key sitting in a `[default]` profile is also the most common way a configuration lands in
+an account nobody meant to touch.
 
 **How this would work in CI.** GitHub Actions would federate to AWS over OIDC:
 `sts:AssumeRoleWithWebIdentity` against an IAM OIDC provider for
@@ -118,12 +123,30 @@ aws service-quotas get-service-quota --service-code ec2 --quota-code L-0263D0A3 
 
 ## Deployment
 
-Two variables are required and have no defaults — the region, and who may reach the Kubernetes API
-server:
+### Step zero: which account is this going into?
+
+Terraform reads credentials from the standard AWS chain. That means the account it deploys into is
+decided by whatever happens to be loaded — a shared `[default]` profile, a stale exported session, a
+forgotten `AWS_PROFILE`. This configuration creates a VPC, an EKS cluster and a NAT Gateway, and
+putting those somewhere they do not belong is expensive at best.
+
+**Check, then name the account.** `allowed_account_ids` is a required variable with no default; the
+provider verifies the caller against it and refuses to create anything if they disagree.
+
+```bash
+export AWS_PROFILE=<the-profile-you-mean>     # set it explicitly; do not rely on [default]
+aws sts get-caller-identity                   # read it, do not skim it
+```
+
+### Then deploy
+
+Three variables are required and have no defaults — the account, the region, and who may reach the
+Kubernetes API server:
 
 ```bash
 cd terraform/
 
+export TF_VAR_allowed_account_ids="[\"$(aws sts get-caller-identity --query Account --output text)\"]"
 export TF_VAR_region=<your-region>
 export TF_VAR_endpoint_public_access_cidrs="[\"$(curl -s https://checkip.amazonaws.com)/32\"]"
 
@@ -133,8 +156,13 @@ terraform plan
 terraform apply
 ```
 
+The account-ID line above reads the account you are *currently* authenticated to, which is only safe
+once you have run `get-caller-identity` and confirmed it is the one you intend. Otherwise set the
+value literally.
+
 | Variable | Default | Notes |
 | --- | --- | --- |
+| `allowed_account_ids` | **none — required** | The accounts this may deploy into. See [Step zero](#step-zero-which-account-is-this-going-into) |
 | `region` | **none — required** | See [Region](#region) |
 | `endpoint_public_access_cidrs` | **none — required** | Who may reach the Kubernetes API server. See [Cluster access](#cluster-access) |
 | `name` | `opsfleet-poc` | Resource prefix **and** the `karpenter.sh/discovery` tag value |

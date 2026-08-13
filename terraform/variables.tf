@@ -16,6 +16,40 @@ variable "region" {
   }
 }
 
+variable "allowed_account_ids" {
+  description = <<-EOT
+    AWS account IDs this configuration is permitted to deploy into. Required,
+    with no default.
+
+    Terraform picks up credentials from the standard AWS chain, which means a
+    forgotten AWS_PROFILE, a stale exported session or a shared `[default]`
+    profile silently decides which account gets a new VPC, an EKS cluster and a
+    NAT Gateway. That failure is quiet, it is expensive, and on a production
+    account it is worse than expensive.
+
+    Naming the account turns "whichever credentials happened to be loaded" into
+    a value the plan has to agree with. If the caller is in a different account,
+    the provider stops before creating anything.
+
+    Find yours:
+      aws sts get-caller-identity --query Account --output text
+
+    Keep the value out of version control — pass it on the command line or in a
+    tfvars file, which .gitignore already excludes.
+  EOT
+  type        = list(string)
+
+  validation {
+    condition     = length(var.allowed_account_ids) > 0
+    error_message = "At least one account ID is required. This is a guardrail against deploying into whichever account your credentials happen to point at."
+  }
+
+  validation {
+    condition     = alltrue([for a in var.allowed_account_ids : can(regex("^[0-9]{12}$", a))])
+    error_message = "Each entry must be a 12-digit AWS account ID. Find yours with: aws sts get-caller-identity --query Account --output text"
+  }
+}
+
 variable "name" {
   description = <<-EOT
     Name prefix for every resource, and the value used for the
