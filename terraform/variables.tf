@@ -54,6 +54,28 @@ variable "kubernetes_version" {
   }
 }
 
+variable "karpenter_version" {
+  description = <<-EOT
+    Karpenter Helm chart version. The chart and the controller are released
+    together.
+
+    Must satisfy the published compatibility matrix for the chosen Kubernetes
+    version: 1.36 requires Karpenter >= 1.13, 1.35 requires >= 1.9. Karpenter
+    follows semantic versioning at v1.x and puts breaking changes in minor
+    releases, so read the upgrade notes before moving this.
+
+    Pinned rather than floating: a moving chart version in a deployment whose
+    stated goal is reproducibility is a contradiction.
+  EOT
+  type        = string
+  default     = "1.14.0"
+
+  validation {
+    condition     = can(regex("^1\\.(1[3-9]|[2-9][0-9])\\.[0-9]+$", var.karpenter_version))
+    error_message = "karpenter_version must be 1.13.0 or later, which is the minimum for Kubernetes 1.36. If deploying against 1.35, 1.9+ is sufficient and this validation can be relaxed deliberately."
+  }
+}
+
 variable "endpoint_public_access_cidrs" {
   description = <<-EOT
     CIDR blocks allowed to reach the public EKS API server endpoint.

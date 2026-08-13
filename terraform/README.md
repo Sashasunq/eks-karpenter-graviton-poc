@@ -1,7 +1,8 @@
 # EKS + Karpenter proof of concept — Terraform
 
-> **Build status: incomplete.** This directory currently creates the **network and the EKS cluster**.
-> Karpenter, the NodePools and the example workloads are **not implemented yet**.
+> **Build status: incomplete.** This directory creates the **network, the EKS cluster and the
+> Karpenter controller**. The NodePools, the EC2NodeClass and the example workloads are **not
+> implemented yet** — so Karpenter is running but has not yet been told what it may provision.
 > See [Current scope](#current-scope) for exactly what exists today.
 
 ---
@@ -27,7 +28,8 @@ every claim is checkable.
 | EKS cluster, access entries, control-plane logging | **implemented** |
 | Managed add-ons: VPC CNI, CoreDNS, kube-proxy, Pod Identity Agent | **implemented** |
 | Bootstrap managed node group | **implemented** |
-| Karpenter controller, IAM, Spot interruption queue | not implemented |
+| Karpenter controller IAM, Pod Identity, Spot interruption queue | **implemented** |
+| Karpenter controller (Helm) | **implemented** |
 | `EC2NodeClass` and `NodePool` objects | not implemented |
 | Example x86 / ARM64 / multi-arch workloads | not implemented |
 
@@ -44,6 +46,7 @@ applied and verified.
 | Terraform | **>= 1.5.7** | Required by `terraform-aws-modules/eks` v21 |
 | AWS CLI | v2 | Credentials and the pre-flight checks below |
 | `kubectl` | matching the cluster minor version | Not needed until the cluster exists |
+| Helm | not required | Terraform's Helm provider is used; the `helm` CLI is only useful for debugging |
 
 Verified working with Terraform 1.5.7 and AWS provider 6.58.0.
 
@@ -136,6 +139,7 @@ terraform apply
 | `endpoint_public_access_cidrs` | **none — required** | Who may reach the Kubernetes API server. See [Cluster access](#cluster-access) |
 | `name` | `opsfleet-poc` | Resource prefix **and** the `karpenter.sh/discovery` tag value |
 | `kubernetes_version` | `1.36` | `1.35` is a supported fallback |
+| `karpenter_version` | `1.14.0` | Chart and controller are released together. 1.36 requires >= 1.13 |
 | `vpc_cidr` | `10.0.0.0/16` | Must be /20 or larger. A /20 works but yields /24 private subnets, which limits pod density |
 | `az_count` | `3` | Clamped to the zones the region actually has |
 | `endpoint_public_access` | `true` | See [Cluster access](#cluster-access) |
@@ -328,6 +332,47 @@ aws eks describe-addon-versions --kubernetes-version 1.36 --region "$AWS_REGION"
 `eks-pod-identity-agent` is the one that is easy to forget and hard to diagnose: without it, EKS Pod
 Identity fails silently and the workload reports `AccessDenied` with no mention of the agent.
 
+### Karpenter
+
+Karpenter 1.14.0, installed as a Helm chart from `oci://public.ecr.aws/karpenter`. The chart version
+is pinned; a floating version in a deliberately reproducible deployment is a contradiction.
+
+**What Terraform creates on the AWS side** (`terraform-aws-modules/eks//modules/karpenter`):
+
+| Resource | Why it matters |
+| --- | --- |
+| Controller IAM role + **scoped** policy | Not `AmazonEC2FullAccess`. The controller can manage the instances it owns, not the account |
+| **EKS Pod Identity association** | Binds that role to the `karpenter` service account in `kube-system` |
+| Node IAM role + instance profile | What Karpenter attaches to the instances it launches |
+| EKS **access entry** for the node role | Without it, provisioned nodes cannot join the cluster |
+| **SQS queue + EventBridge rules** | Spot interruption, capacity rebalance, instance state change |
+
+**Pod Identity, not IRSA.** IRSA needs an OIDC provider, a trust policy templated with the cluster's
+issuer URL, and a service-account annotation carrying a role ARN — three coupled things that must
+stay consistent. Pod Identity needs one association, and the binding is a visible AWS resource
+(`aws eks list-pod-identity-associations`) rather than a Kubernetes annotation you have to know to
+look for. It also requires the `eks-pod-identity-agent` add-on: without it, credentials fail
+silently and the controller logs `AccessDenied` with no mention of the agent.
+
+**Spot interruption handling is wired, not merely provisioned.** The queue exists because
+`enable_spot_termination = true`; it is *read* because `settings.interruptionQueue` points the
+controller at it. Creating the queue without that value is a common and quiet failure — everything
+looks configured and nothing consumes the notices.
+
+> **Not yet verified.** Nothing here has been deployed. In particular, interruption handling is
+> **configured**, not **demonstrated**: proving it requires triggering a real interruption (AWS Fault
+> Injection Service) and observing the controller cordon and drain. Terminating an instance by hand
+> tests node-failure recovery, which is a different thing and does not evidence this path.
+
+**Chart defaults deliberately left alone**, because they solve real problems:
+
+| Default | What it prevents |
+| --- | --- |
+| `nodeAffinity: karpenter.sh/nodepool DoesNotExist` | Karpenter scheduling onto a node it provisioned — and then consolidating itself away. **This is why no `nodeSelector` pinning the controller to the system group is added**: it would be a second, weaker expression of the same intent |
+| `podAntiAffinity` on `kubernetes.io/hostname`, **required** | The two replicas landing on one node. With a single-node bootstrap group one replica would sit `Pending` forever — which is why `min_size = 2` is a hard requirement and not a preference |
+| `topologySpreadConstraints` on zone, `DoNotSchedule` | Both replicas in one Availability Zone |
+| `priorityClassName: system-cluster-critical` + PDB | The controller being evicted to make room for application workloads |
+
 ### Bootstrap node group
 
 Karpenter is a pod, so it needs a node before it can provision any. This group is that node, and
@@ -346,6 +391,32 @@ and it is rejected here: no DaemonSet support, slower pod start, and it forces I
 Pod Identity. **EKS Auto Mode** is AWS-managed Karpenter — it would satisfy "nodes autoscale" while
 bypassing everything this proof of concept exists to demonstrate, and it adds a per-instance
 management fee.
+
+---
+
+## Planning before the cluster exists
+
+The Helm provider is configured from the EKS cluster this same configuration creates. On a **cold
+run**, before any of it exists, the cluster endpoint and CA data are unknown at plan time.
+
+This is a property of putting an in-cluster resource and the cluster in one configuration, not a
+defect, and it is not worked around by hard-coding an endpoint — that would trade a visible
+inconvenience for an invisible staleness bug.
+
+If a cold `terraform plan` cannot resolve the Helm release, apply the AWS layer first and then the
+whole configuration:
+
+```bash
+terraform apply -target=module.vpc -target=module.eks -target=module.karpenter
+terraform apply
+```
+
+`-target` is a deliberate two-stage bootstrap here, not a way of avoiding a problem. On every
+subsequent run the cluster already exists and a plain `plan` resolves everything.
+
+**In production this would not arise**, because the boundary would be drawn differently: Terraform
+would own the AWS resources and a GitOps controller would own everything inside the cluster. That
+boundary is relaxed here on purpose — see [Deliberately out of scope](#deliberately-out-of-scope).
 
 ---
 
@@ -411,7 +482,7 @@ Absences that are decisions, not oversights:
 | --- | --- |
 | Remote state backend | See [Terraform state](#terraform-state) |
 | CI/CD pipeline | The authentication model is documented above; building a pipeline would add infrastructure the assessment does not ask for |
-| GitOps controller (Argo CD / Flux) | In production, in-cluster objects belong to a GitOps controller rather than to Terraform. Here, a single `terraform apply` producing a schedulable cluster is worth more than the lifecycle boundary |
+| GitOps controller (Argo CD / Flux) | In production, in-cluster objects — the Karpenter chart and the NodePools — belong to a GitOps controller rather than to Terraform. Terraform would still create the IAM role, the Pod Identity association and the SQS queue, because those are AWS resources. Here, a single `terraform apply` producing a schedulable cluster is worth more than that boundary, and the cost is the plan-time limitation described above |
 | One NAT Gateway per AZ | Cost, for a stack that lives hours. `var.single_nat_gateway = false` flips it |
 | VPC endpoints | See [Cost](#cost) |
 | Ingress controller, observability stack, NetworkPolicy, admission control | Real production controls that demonstrate nothing about Karpenter and would obscure what does |
@@ -427,10 +498,11 @@ Absences that are decisions, not oversights:
 terraform/
 ├── README.md
 ├── versions.tf     required_version and provider constraints
-├── providers.tf    AWS provider; standard credential chain; default tags
+├── providers.tf    AWS provider (standard credential chain, default tags); Helm provider via exec auth
 ├── variables.tf    region (no default), name, vpc_cidr, az_count, single_nat_gateway, tags
 ├── vpc.tf          AZ discovery, subnet CIDR maths, the VPC module and its tags
 ├── eks.tf          cluster, endpoint access, access entries, logging, add-ons, bootstrap node group
+├── karpenter.tf    controller IAM, Pod Identity, interruption queue, Helm release
 ├── outputs.tf      values an operator or a later phase actually consumes
 ├── .gitignore
 └── .terraform.lock.hcl   provider checksums for darwin/linux on amd64 and arm64

@@ -14,5 +14,12 @@ terraform {
       # provider checksums.
       version = "~> 6.58"
     }
+
+    # Installs the Karpenter chart. Version 3.x changed the provider schema:
+    # `kubernetes` and `exec` are attributes rather than nested blocks.
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 3.2"
+    }
   }
 }
