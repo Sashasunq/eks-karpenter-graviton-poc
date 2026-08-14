@@ -1,8 +1,9 @@
 # EKS + Karpenter proof of concept — Terraform
 
-> **Build status: incomplete.** This directory creates the **network, the EKS cluster and the
-> Karpenter controller**. The NodePools, the EC2NodeClass and the example workloads are **not
-> implemented yet** — so Karpenter is running but has not yet been told what it may provision.
+> **Build status: complete, not yet deployed.** `terraform apply` produces a cluster ready to
+> schedule workloads on x86_64 and ARM64 Spot capacity. Nothing here has been applied to AWS yet, so
+> every statement about behaviour below is about intended behaviour. This note goes away once the
+> stack has been applied and verified.
 > See [Current scope](#current-scope) for exactly what exists today.
 
 ---
@@ -30,8 +31,8 @@ every claim is checkable.
 | Bootstrap managed node group | **implemented** |
 | Karpenter controller IAM, Pod Identity, Spot interruption queue | **implemented** |
 | Karpenter controller (Helm) | **implemented** |
-| `EC2NodeClass` and `NodePool` objects | not implemented |
-| Example x86 / ARM64 / multi-arch workloads | not implemented |
+| `EC2NodeClass` and two `NodePool` objects | **implemented** |
+| Example x86 / ARM64 / multi-arch workloads | **implemented** |
 
 Nothing in this repository has been deployed to AWS yet. Every statement below about behaviour is
 therefore about **intended** behaviour, and this note will be removed once the stack has been
@@ -168,27 +169,101 @@ value literally.
 | `name` | `opsfleet-poc` | Resource prefix **and** the `karpenter.sh/discovery` tag value |
 | `kubernetes_version` | `1.36` | `1.35` is a supported fallback |
 | `karpenter_version` | `1.14.0` | Chart and controller are released together. 1.36 requires >= 1.13 |
+| `ami_alias` | `al2023@v20260810` | One alias serves both architectures. Use `al2023@latest` if this release is unavailable in your region |
+| `nodepool_cpu_limit` | `4` | Per-NodePool ceiling |
+| `consolidate_after` | `1m` | Short so consolidation is observable; production sets it above workload warm-up |
 | `vpc_cidr` | `10.0.0.0/16` | Must be /20 or larger. A /20 works but yields /24 private subnets, which limits pod density |
 | `az_count` | `3` | Clamped to the zones the region actually has |
 | `endpoint_public_access` | `true` | See [Cluster access](#cluster-access) |
 | `single_nat_gateway` | `true` | Set `false` for one NAT per AZ — see [Cost](#cost) |
 
-### Planned deployment flow
+---
 
-Once the remaining phases land, the intended end-to-end flow is:
+## Verification
 
-1. `terraform apply` — VPC, EKS cluster, add-ons, a small managed node group, Karpenter and its
-   NodePools. The result is a cluster ready to schedule workloads.
-2. `aws eks update-kubeconfig --name <name> --region <region>`
-3. `kubectl apply -f examples/x86-deployment.yaml` — observe Karpenter provision an x86_64 Spot node.
-4. `kubectl apply -f examples/arm64-deployment.yaml` — observe it provision a Graviton Spot node.
-5. Verify with `kubectl exec <pod> -- uname -m`, which returns `x86_64` and `aarch64` respectively.
-6. Scale down and watch consolidation remove the nodes.
-7. Tear down in order — NodePools first, then `terraform destroy` — then verify nothing was left
-   behind.
+Roughly 25 minutes end to end, most of it EKS creating the control plane.
 
-Steps 1–7 are **not yet implemented or tested**. They describe the intended shape, not observed
-behaviour.
+```bash
+# 1. cluster
+terraform apply                                     # ~15-20 min
+aws eks update-kubeconfig --name opsfleet-poc --region "$AWS_REGION"
+
+kubectl get nodes                                   # 2 bootstrap nodes, Ready
+kubectl -n kube-system get deploy karpenter         # 2/2
+kubectl get nodepools,ec2nodeclasses                # both NodePools Ready=True
+```
+
+If a NodePool is not `Ready`, look at the NodeClass status before anything else — unresolved
+selectors mean the `karpenter.sh/discovery` tags did not match, which is the most common Karpenter
+setup failure:
+
+```bash
+kubectl get ec2nodeclass default -o yaml | grep -A20 '^status:'
+```
+
+```bash
+# 2. x86, then ARM64
+kubectl apply -f examples/x86-deployment.yaml
+kubectl get nodeclaims -w                           # ~60-90s to Ready
+
+kubectl apply -f examples/arm64-deployment.yaml
+kubectl get nodeclaims -w
+
+# 3. the evidence
+kubectl get nodes -L kubernetes.io/arch,karpenter.sh/capacity-type,node.kubernetes.io/instance-type
+kubectl exec deploy/demo-x86   -- uname -m          # x86_64
+kubectl exec deploy/demo-arm64 -- uname -m          # aarch64
+
+# 4. Spot, confirmed against AWS rather than against a label
+aws ec2 describe-instances \
+  --filters "Name=tag:karpenter.sh/nodepool,Values=*" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].[InstanceType,InstanceLifecycle,Placement.AvailabilityZone]' \
+  --output table
+
+# 5. consolidation
+kubectl delete -f examples/
+kubectl get nodeclaims -w                           # nodes drain and go, after consolidateAfter
+```
+
+`uname -m` is the proof. A node label reports what Karpenter believes; `uname` reports what the
+kernel is running on, and `InstanceLifecycle` from the EC2 API is independent of both.
+
+### What is configured but not demonstrated
+
+**Spot interruption handling.** The SQS queue and EventBridge rules exist and the controller is
+pointed at them, but proving the path works means triggering a real interruption with AWS Fault
+Injection Service and watching the controller cordon and drain. Terminating an instance by hand
+tests *node-failure recovery*, which is a different mechanism and does not evidence this one.
+
+Until that test is run, the honest claim is "configured", not "verified".
+
+---
+
+## Cleanup
+
+**Order matters.** Karpenter-provisioned instances are not in Terraform state, so they must drain
+while the controller is still alive to drain them. Destroying the cluster first orphans them, and
+the VPC delete then blocks on ENIs belonging to instances Terraform does not know about.
+
+```bash
+kubectl delete -f examples/                             # 1. workloads
+kubectl delete nodepool --all                           # 2. stop provisioning
+kubectl wait --for=delete nodeclaim --all --timeout=10m # 3. wait for nodes to actually go
+terraform destroy                                       # 4. only now
+```
+
+Then verify, rather than assume:
+
+```bash
+aws ec2 describe-instances --filters "Name=tag:karpenter.sh/nodepool,Values=*" \
+  "Name=instance-state-name,Values=running" --query 'length(Reservations)'
+aws ec2 describe-nat-gateways --filter "Name=state,Values=available" --query 'length(NatGateways)'
+aws ec2 describe-volumes --filters "Name=status,Values=available" --query 'length(Volumes)'
+aws ec2 describe-addresses --query 'length(Addresses)'
+```
+
+All should return `0` for resources belonging to this stack. Orphaned EBS volumes and Elastic IPs
+are the classic post-teardown bill.
 
 ---
 
@@ -531,6 +606,8 @@ terraform/
 ├── vpc.tf          AZ discovery, subnet CIDR maths, the VPC module and its tags
 ├── eks.tf          cluster, endpoint access, access entries, logging, add-ons, bootstrap node group
 ├── karpenter.tf    controller IAM, Pod Identity, interruption queue, Helm release
+├── karpenter-nodepools.tf   EC2NodeClass + NodePools, via the local chart below
+├── charts/karpenter-resources/   the manifests, readable as Kubernetes YAML
 ├── outputs.tf      values an operator or a later phase actually consumes
 ├── .gitignore
 └── .terraform.lock.hcl   provider checksums for darwin/linux on amd64 and arm64

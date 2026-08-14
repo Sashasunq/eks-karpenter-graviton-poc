@@ -1,0 +1,19 @@
+# Every value here is supplied by Terraform. The defaults exist so the chart can
+# be rendered standalone with `helm template` for review.
+
+nodeIamRoleName: ""
+discoveryTag: ""
+amiAlias: ""
+zones: []
+cpuLimit: "4"
+expireAfter: "720h"
+consolidateAfter: "1m"
+tags: {}
+
+nodePools:
+  - name: x86-spot
+    arch: amd64
+    archLabel: x86
+  - name: arm64-spot
+    arch: arm64
+    archLabel: graviton

@@ -1,0 +1,8 @@
+apiVersion: v2
+name: karpenter-resources
+description: >-
+  The EC2NodeClass and NodePools that tell Karpenter what it may provision.
+  A local chart rather than a Terraform provider resource — see the comment in
+  ../../karpenter-nodepools.tf for why.
+type: application
+version: 0.1.0

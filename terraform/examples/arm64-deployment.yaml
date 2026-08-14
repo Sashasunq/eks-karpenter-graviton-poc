@@ -1,0 +1,52 @@
+# Schedules deliberately onto ARM64 (AWS Graviton).
+#
+# Identical to x86-deployment.yaml except for one word in the nodeSelector.
+# That is the point: adopting Graviton is a scheduling change, not a rewrite —
+# provided the image has an arm64 variant, which is the part that actually
+# takes work in a real migration.
+#
+# Proof, once it is running:
+#   kubectl exec deploy/demo-arm64 -- uname -m     # aarch64
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-arm64
+  labels: { app: demo-arm64 }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: demo-arm64 }
+  template:
+    metadata:
+      labels: { app: demo-arm64 }
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+
+      containers:
+        - name: demo
+          # Multi-architecture image: the same tag resolves to an amd64 or an
+          # arm64 image depending on the node. Verified with the ECR Public
+          # manifest API before this file was written — an image without an
+          # arm64 variant is the most common way the ARM demo fails.
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["sleep", "infinity"]
+
+          resources:
+            requests:
+              # Sized so the pod cannot fit on the bootstrap nodes, which have
+              # roughly 0.8 CPU free each after Karpenter and the DaemonSets.
+              # That is what makes Karpenter provision a node rather than the
+              # scheduler quietly placing the pod on existing capacity — and
+              # provisioning is the thing being demonstrated.
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

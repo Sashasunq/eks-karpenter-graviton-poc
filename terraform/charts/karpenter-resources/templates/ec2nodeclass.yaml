@@ -1,0 +1,47 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  # The IAM role Karpenter turns into an instance profile for the nodes it
+  # launches. Created by the Terraform karpenter submodule, together with the
+  # EKS access entry that lets those nodes join.
+  role: {{ .Values.nodeIamRoleName | quote }}
+
+  # Discovery by tag, not by ID. Terraform tags the private subnets and the node
+  # security group with karpenter.sh/discovery; these terms match them.
+  #
+  # Only private subnets carry the tag, so Karpenter cannot place a workload
+  # node in a public subnet with a public address.
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ .Values.discoveryTag | quote }}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: {{ .Values.discoveryTag | quote }}
+
+  # One alias serves both architectures. Karpenter resolves the correct
+  # EKS-optimized AMI for whichever instance type it picks, so a single
+  # EC2NodeClass backs both the x86 and the ARM64 NodePool.
+  #
+  # Pinned to a release rather than @latest: two applies weeks apart should
+  # produce the same node. The cost is that a pinned AMI does not pick up
+  # security patches on its own, which is what expireAfter on the NodePools is
+  # for. Overridable — see var.ami_alias.
+  amiSelectorTerms:
+    - alias: {{ .Values.amiAlias | quote }}
+
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpTokens: required
+    # A process inside a container is one network hop further from IMDS than one
+    # on the host, so a hop limit of 1 means pods cannot read instance metadata
+    # and therefore cannot assume the node role. Workloads that need AWS
+    # permissions get them through EKS Pod Identity instead.
+    httpPutResponseHopLimit: 1
+
+  tags:
+    {{- range $k, $v := .Values.tags }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}

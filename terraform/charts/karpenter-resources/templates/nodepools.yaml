@@ -1,0 +1,98 @@
+{{- range .Values.nodePools }}
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ .name }}
+spec:
+  template:
+    metadata:
+      labels:
+        workload-arch: {{ .archLabel }}
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+
+      # Nodes are replaced rather than patched in place. A pinned AMI plus a
+      # bounded node lifetime is what makes "reproducible" and "patched"
+      # compatible.
+      expireAfter: {{ $.Values.expireAfter | quote }}
+
+      requirements:
+        # The only line that differs between the two NodePools.
+        - key: kubernetes.io/arch
+          operator: In
+          values: [{{ .arch | quote }}]
+
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+
+        # Spot only. This is the assessment requirement and also the cheap
+        # answer; on-demand capacity in this cluster exists solely as the
+        # bootstrap node group, which Karpenter does not manage.
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot"]
+
+        # Instance *categories*, not named instance types.
+        #
+        # Every instance-type-per-AZ pair is an independent Spot capacity pool,
+        # and adding pools costs nothing. Naming specific types is what produces
+        # UnfulfillableCapacity — a structural failure that recurs at every peak
+        # — as opposed to InsufficientInstanceCapacity, which is transient.
+        #
+        # c, m and r across three generations and three AZs is roughly 18 pools
+        # per architecture here.
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
+
+        # Constrained to 2 vCPU deliberately, and this one is worth explaining:
+        # it is a property of the *demo environment*, not a recommendation. A
+        # new AWS account has a default quota of 5 Standard Spot vCPUs, and both
+        # architectures draw on that same pool, so one x86 node plus one ARM64
+        # node at 2 vCPU each is 4 of 5 and fits. Widen this the moment the
+        # account quota allows — the diversification argument above says so.
+        - key: karpenter.k8s.aws/instance-cpu
+          operator: In
+          values: ["2"]
+
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: {{ $.Values.zones | toJson }}
+
+  # A ceiling you chose, so that a scheduling mistake costs a Pending pod rather
+  # than a bill. Per NodePool, so one architecture cannot consume the other's
+  # budget.
+  #
+  # Note that the two pools together can request more vCPU than a new account's
+  # default Spot quota allows. The demo as written uses one node per
+  # architecture and fits inside it; scaling past that needs an account quota
+  # increase. Two ceilings, and it is worth knowing which one you hit.
+  limits:
+    cpu: {{ $.Values.cpuLimit | quote }}
+
+  disruption:
+    # Removes nodes that are empty, and repacks nodes that are underutilised.
+    # The second half is where the savings are, and PodDisruptionBudgets are
+    # what make it safe.
+    consolidationPolicy: WhenEmptyOrUnderutilized
+
+    # Deliberately short so consolidation is observable during a review rather
+    # than in fifteen minutes' time. In production this must exceed the
+    # workload's warm-up time, or the cluster thrashes: nodes are removed just
+    # as the pods on them become useful.
+    consolidateAfter: {{ $.Values.consolidateAfter | quote }}
+
+    # Rate-limits voluntary disruption. Karpenter rounds percentages up, so a
+    # static "1" and "10%" behave identically at this size; the static value
+    # says what it means without arithmetic.
+    budgets:
+      - nodes: "1"
+{{- end }}

@@ -1,0 +1,57 @@
+# Runs on either architecture — Karpenter picks.
+#
+# This is the shape most workloads should have once their image is multi-arch:
+# state that either will do, and let the provisioner choose on price and
+# availability. Constraining to one architecture is the exception that should
+# need a reason.
+#
+# Expressed as nodeAffinity rather than nodeSelector because a nodeSelector
+# cannot say "either". Same mechanism, more expressive syntax.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-multi-arch
+  labels: { app: demo-multi-arch }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-multi-arch }
+  template:
+    metadata:
+      labels: { app: demo-multi-arch }
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+
+      # Spread across zones. Karpenter reads this when deciding where to place
+      # capacity, so it provisions into different AZs rather than stacking both
+      # replicas in one.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: demo-multi-arch }
+
+      containers:
+        - name: demo
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

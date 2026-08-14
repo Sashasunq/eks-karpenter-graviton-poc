@@ -1,0 +1,48 @@
+# Schedules deliberately onto x86_64.
+#
+# The only line that decides the architecture is the nodeSelector. Nothing here
+# names an instance type — the pod states what it needs and Karpenter picks
+# hardware that satisfies it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-x86
+  labels: { app: demo-x86 }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: demo-x86 }
+  template:
+    metadata:
+      labels: { app: demo-x86 }
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+
+      containers:
+        - name: demo
+          # Multi-architecture image: the same tag resolves to an amd64 or an
+          # arm64 image depending on the node. Verified with the ECR Public
+          # manifest API before this file was written — an image without an
+          # arm64 variant is the most common way the ARM demo fails.
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["sleep", "infinity"]
+
+          resources:
+            requests:
+              # Sized so the pod cannot fit on the bootstrap nodes, which have
+              # roughly 0.8 CPU free each after Karpenter and the DaemonSets.
+              # That is what makes Karpenter provision a node rather than the
+              # scheduler quietly placing the pod on existing capacity — and
+              # provisioning is the thing being demonstrated.
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

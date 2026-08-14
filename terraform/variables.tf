@@ -110,6 +110,48 @@ variable "karpenter_version" {
   }
 }
 
+variable "ami_alias" {
+  description = <<-EOT
+    EKS-optimized AMI alias for Karpenter-provisioned nodes. One alias serves
+    both architectures — Karpenter resolves the right image for whichever
+    instance type it picks.
+
+    Pinned to a release rather than `al2023@latest`, because two applies weeks
+    apart should produce the same node. If this exact release is unavailable in
+    your region, use `al2023@latest` or look up a current one:
+
+      aws ssm get-parameter --region <region> \
+        --name /aws/service/eks/optimized-ami/1.36/amazon-linux-2023/x86_64/standard/recommended/release_version
+  EOT
+  type        = string
+  default     = "al2023@v20260810"
+}
+
+variable "nodepool_cpu_limit" {
+  description = <<-EOT
+    Per-NodePool CPU ceiling. A scheduling mistake should cost a Pending pod,
+    not a bill.
+
+    Note there are two ceilings: this one, which you chose, and the account's
+    Spot vCPU quota, which you inherited — 5 on a new account, shared between
+    both architectures. The demo uses 4 and fits inside both.
+  EOT
+  type        = string
+  default     = "4"
+}
+
+variable "consolidate_after" {
+  description = <<-EOT
+    How long a node must be empty or underutilised before Karpenter removes it.
+
+    One minute is deliberately short so consolidation is observable during a
+    review. In production this must exceed the workload's warm-up time, or the
+    cluster thrashes — nodes removed just as the pods on them become useful.
+  EOT
+  type        = string
+  default     = "1m"
+}
+
 variable "endpoint_public_access_cidrs" {
   description = <<-EOT
     CIDR blocks allowed to reach the public EKS API server endpoint.
