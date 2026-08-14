@@ -150,7 +150,12 @@ module "eks" {
 
       min_size     = 2
       desired_size = 2
-      max_size     = 3 # bounded: this group is not where growth happens
+
+      # Equal to desired_size, not higher. A managed node group can temporarily
+      # run up to max_size during an update, and 3 x m6i.large is 6 vCPU —
+      # above the 5 vCPU default quota on a new account. Growth belongs to
+      # Karpenter anyway, so there is nothing to gain from headroom here.
+      max_size = 2
 
       labels = {
         "node-role" = "system"
