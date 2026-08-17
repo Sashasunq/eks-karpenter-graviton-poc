@@ -35,5 +35,6 @@ resource "helm_release" "karpenter_resources" {
   })]
 
   # The CRDs ship with the Karpenter chart, so that release has to land first.
-  depends_on = [helm_release.karpenter]
+  # module.eks for the same destroy-ordering reason as in karpenter.tf.
+  depends_on = [helm_release.karpenter, module.eks]
 }

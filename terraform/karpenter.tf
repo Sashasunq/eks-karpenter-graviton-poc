@@ -27,6 +27,20 @@ module "karpenter" {
 
   cluster_name = module.eks.cluster_name
 
+  # The controller policy is attached inline to its role rather than as a
+  # standalone managed policy. Not a style preference — a managed IAM policy is
+  # capped at 6144 characters and this one does not fit.
+  #
+  # Measured, in eu-central-1: the rendered policy is 6218 characters, over by
+  # 74. The region name appears 32 times in it, so the same configuration is
+  # 6122 characters in us-east-1 — under the limit by 22 — and 6282 in
+  # ap-southeast-1. **This configuration's validity depends on how long the
+  # region's name is.**
+  #
+  # An inline role policy is capped at 10240 instead, which leaves ~4000
+  # characters of headroom and works in every region.
+  enable_inline_policy = true
+
   # Pod Identity, not IRSA. IRSA needs an OIDC provider, a trust policy
   # templated with the cluster's issuer URL, and a service-account annotation
   # carrying a role ARN — three coupled things to keep consistent. Pod Identity
@@ -95,7 +109,18 @@ resource "helm_release" "karpenter" {
     }
   })]
 
-  depends_on = [module.karpenter]
+  # module.karpenter for the IAM role, Pod Identity association and SQS queue.
+  #
+  # module.eks is the one that is easy to miss and matters on **destroy**. The
+  # Helm provider reaches the cluster through values read from module.eks, but a
+  # provider-level dependency is not an edge in Terraform's resource graph — so
+  # without this, `terraform destroy` is free to start tearing down the cluster
+  # concurrently with the Helm uninstall. Measured: it does, and the uninstall
+  # then fails with `Error uninstalling release` once the API server is gone.
+  #
+  # depends_on creates the edge, and destroy reverses it: Helm is uninstalled
+  # before anything touches the cluster.
+  depends_on = [module.karpenter, module.eks]
 }
 
 # Chart defaults deliberately left alone, because they solve real problems:

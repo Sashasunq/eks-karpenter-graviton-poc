@@ -1,10 +1,8 @@
 # EKS + Karpenter proof of concept — Terraform
 
-> **Build status: complete, not yet deployed.** `terraform apply` produces a cluster ready to
-> schedule workloads on x86_64 and ARM64 Spot capacity. Nothing here has been applied to AWS yet, so
-> every statement about behaviour below is about intended behaviour. This note goes away once the
-> stack has been applied and verified.
-> See [Current scope](#current-scope) for exactly what exists today.
+> **Deployed and verified**, `eu-central-1`, 2026-08-17. Both architectures confirmed by `uname -m`,
+> Spot confirmed against the EC2 API, consolidation observed, teardown verified clean.
+> Results, and the five failures found on the way: [Run log](#run-log).
 
 ---
 
@@ -37,9 +35,157 @@ headline capability, with the manifests and the commands.
 | `EC2NodeClass` and two `NodePool` objects | **implemented** |
 | Example x86 / ARM64 / multi-arch workloads | **implemented** |
 
-Nothing in this repository has been deployed to AWS yet. Every statement below about behaviour is
-therefore about **intended** behaviour, and this note will be removed once the stack has been
-applied and verified.
+---
+
+## Run log
+
+Applied to a real AWS account in `eu-central-1` on 2026-08-17, verified, and destroyed. Everything
+below is measured, not intended.
+
+### Results
+
+| Phase | Result |
+| --- | --- |
+| Cold `terraform plan`, empty account | **82 resources, one pass.** No `-target` bootstrap needed — see [Planning before the cluster exists](#planning-before-the-cluster-exists) |
+| EKS control plane | **ACTIVE in 8m30s**, Kubernetes 1.36 |
+| Bootstrap node group | 2 × `m6i.large`, on-demand, in separate AZs |
+| Karpenter | **2/2 replicas**, on two different nodes — the chart's required `podAntiAffinity` in action, which is why `min_size = 2` is not optional |
+| `EC2NodeClass` status | 3 subnets, 1 security group, **5 AMIs across both architectures** — one alias does serve both |
+| Controller image running | `public.ecr.aws/karpenter/controller:1.14.0` — the chart pin does determine the image |
+| **x86 workload** | Node provisioned in **152s**, `c7i-flex.large`, spot → **`uname -m` = `x86_64`** |
+| **ARM64 workload** | Node provisioned in **39s**, `c6g.large`, spot → **`uname -m` = `aarch64`** |
+| Spot, confirmed against AWS | `InstanceLifecycle: spot` on both, from `describe-instances` — not just the node label |
+| Consolidation | Empty node cordoned, drained and deleted **132s** after the workload went away |
+| Teardown | Ordered delete, then `terraform destroy`. Verified: 0 instances, 0 NAT gateways, 0 unattached volumes, 0 Elastic IPs, 0 VPCs |
+
+ARM64 provisioned faster than x86 only because Karpenter's instance-type cache was already warm by
+then; it is not an architecture difference.
+
+### Five failures, and what they were
+
+None of these are findable by `terraform validate`, and every one of them is environment-dependent.
+That is the argument for running the thing rather than reading it — and for not trusting a default
+region, a default profile or a default account to be representative.
+
+**1. Karpenter's IAM policy does not fit — and whether it fits depends on the region's name.**
+
+```text
+LimitExceeded: Cannot exceed quota for PolicySize: 6144
+```
+
+Measured from state: the rendered policy is **6218 characters, over the managed-policy limit by 74**.
+The region name appears in it **32 times**, so:
+
+| Region | Policy size | |
+| --- | --- | --- |
+| `us-east-1` | 6122 | fits, by 22 characters |
+| `eu-west-1` | 6122 | fits |
+| **`eu-central-1`** | **6218** | **fails by 74** |
+| `ap-southeast-1` | 6282 | fails by 138 |
+
+The same configuration works in `us-east-1` and fails in `eu-central-1` because the region's name is
+three characters longer. Fixed with `enable_inline_policy = true` — an inline role policy is capped
+at 10240 instead of 6144. **A `us-east-1` default would have hidden this until someone deployed to
+Europe.**
+
+**2. The exec plugin depends on the operator's AWS CLI output format.**
+
+```text
+Kubernetes cluster unreachable: getting credentials: decoding stdout:
+couldn't get version/kind; json parse error
+```
+
+The message points at the cluster. The cause is that the profile had `output = table`, so
+`aws eks get-token` printed an ASCII table instead of an `ExecCredential` object. Fixed by adding
+`--output json` to the exec args, so the configuration no longer depends on a setting in someone
+else's `~/.aws/config`.
+
+**3. A brand-new AWS account cannot launch Spot at all.**
+
+```text
+AuthFailure.ServiceLinkedRoleCreationNotPermitted: The provided credentials do not have
+permission to create the service-linked role for EC2 Spot Instances.
+```
+
+wrapped inside an `UnfulfillableCapacity` from `CreateFleet`, and followed by repeated
+`nodepool requirements filtered out all instance types` — which is what you see *after* a failed
+launch, because Karpenter caches the types as temporarily unavailable. Read only the top line and
+you go and rewrite the NodePool. The requirements were fine: Karpenter had matched **42 instance
+types**.
+
+The account was missing `AWSServiceRoleForEC2Spot`. One command, once per account:
+
+```bash
+aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
+```
+
+See [Prerequisites](#one-account-level-prerequisite).
+
+**4. `terraform destroy` tore the cluster down while Helm was still uninstalling.**
+
+```text
+Error: Error uninstalling release
+```
+
+The Helm provider reaches the cluster through values read from `module.eks` — but a **provider-level
+dependency is not an edge in Terraform's resource graph.** With default parallelism, destroy started
+removing EKS resources concurrently with the Helm uninstall, and the uninstall failed once the API
+server was unreachable. Re-running finished the job, which is the worst kind of bug: it looks
+transient.
+
+Fixed with an explicit `depends_on = [module.eks]` on both releases, which creates the edge; destroy
+reverses it and uninstalls Helm first.
+
+**This is empirical evidence for the boundary this POC deliberately relaxed.** In production the
+chart and the NodePools would belong to a GitOps controller, and "destroy the cluster" and "remove
+what is inside the cluster" would not be two halves of one dependency graph. The cost of relaxing it
+was documented here as a plan-time inconvenience; it is actually a destroy-time correctness problem.
+
+**5. A VPC CNI ENI outlived its instance and blocked the whole VPC.**
+
+```text
+Error: deleting Security Group (sg-…): DependencyViolation: resource has a dependent object
+eni-0f40584c111aad9f3   available   aws-K8S-i-04a43fa47de55c436
+```
+
+The ordered teardown did its job — both NodeClaims drained and `kubectl get nodeclaims` returned
+`No resources found` before Terraform ran. But a **secondary ENI created by the VPC CNI** survived
+the instance it belonged to, still referencing the node security group: ENI blocks security group,
+which blocks subnet, which blocks VPC.
+
+The ordered teardown addresses instances *Karpenter* owns and Terraform does not. This interface
+belongs to a different lifecycle. **Necessary, and not sufficient** — the README said the former and
+implied the latter, and that has been corrected in [Cleanup](#cleanup).
+
+Deleting the orphan and re-running finished cleanly. What caught it was the post-destroy
+verification, not the destroy output.
+
+### Graviton on Spot is not 20% cheaper
+
+Prices for the two instance types this run actually launched, `eu-central-1`, at the time of the run:
+
+| | x86 `c7i-flex.large` | ARM `c6g.large` | Graviton |
+| --- | --- | --- | --- |
+| **On-demand** | $0.0968/h | $0.0776/h | **19.8% cheaper** |
+| Spot, `eu-central-1a` | $0.0432 | $0.0362 | 16.2% cheaper |
+| Spot, `eu-central-1b` | $0.0427 | $0.0424 | 0.7% cheaper |
+| Spot, `eu-central-1c` | $0.0407 | $0.0414 | **1.7% more expensive** |
+| **Spot, average** | $0.0422 | $0.0400 | **5.2% cheaper** |
+
+The familiar "Graviton is about 20% cheaper" is an **on-demand** number, and it holds. On **Spot**
+the market largely competes it away: Spot price tracks supply and demand in that specific pool, not
+the list discount — and in one Availability Zone Graviton was the more expensive option.
+
+The case for Graviton on Spot is therefore capacity diversification and price/performance, not a
+headline discount. Anyone forecasting savings from the on-demand figure while running on Spot will
+miss.
+
+### Not verified
+
+**Spot interruption handling.** The queue, the EventBridge rules and `settings.interruptionQueue`
+are all in place, but proving the path requires triggering a real interruption with AWS Fault
+Injection Service. Deleting a node or terminating an instance tests node-failure recovery, which is
+a different mechanism. Until that test runs, the claim is "configured", not "verified".
 
 ---
 
@@ -55,6 +201,26 @@ applied and verified.
 Verified working with Terraform 1.5.7 and AWS provider 6.58.0.
 
 You also need AWS credentials with permission to create VPC, EC2, IAM and EKS resources.
+
+### One account-level prerequisite
+
+**The EC2 Spot service-linked role must exist in the account.** It normally does; a brand-new
+account has never requested Spot, so it does not, and Karpenter cannot create it itself:
+
+```bash
+aws iam get-role --role-name AWSServiceRoleForEC2Spot >/dev/null 2>&1 \
+  || aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
+```
+
+This is deliberately **not** in the Terraform. The role is account-global rather than
+stack-scoped, so creating it here would fail in every account that already has one, and destroying
+it would break Spot for anything else in the account. A one-line prerequisite is the honest shape.
+
+Skip it and every Spot launch fails with `UnfulfillableCapacity`, with the real cause buried inside
+the error — see [Run log, failure 3](#three-failures-and-what-they-were).
+
+A new account may also have its first EC2 launches held for validation, and Standard Spot vCPU
+quota at the default of 5. Both are covered in [Region](#region).
 
 ---
 
@@ -358,9 +524,11 @@ Until that test is run, the honest claim is "configured", not "verified".
 
 ## Cleanup
 
-**Order matters.** Karpenter-provisioned instances are not in Terraform state, so they must drain
-while the controller is still alive to drain them. Destroying the cluster first orphans them, and
-the VPC delete then blocks on ENIs belonging to instances Terraform does not know about.
+**Order matters, and it is not sufficient on its own.** Both halves of that sentence were learned
+the hard way — see [Run log](#run-log).
+
+Karpenter-provisioned instances are not in Terraform state, so they must drain while the controller
+is still alive to drain them:
 
 ```bash
 kubectl delete -f examples/                             # 1. workloads
@@ -369,18 +537,67 @@ kubectl wait --for=delete nodeclaim --all --timeout=10m # 3. wait for nodes to a
 terraform destroy                                       # 4. only now
 ```
 
-Then verify, rather than assume:
+That worked: both NodeClaims reported `condition met` and `kubectl get nodeclaims` returned
+`No resources found` before Terraform started.
+
+### It still did not finish, and here is what to expect
+
+```text
+Error: deleting Security Group (sg-…): DependencyViolation: resource has a dependent object
+```
+
+A **secondary ENI created by the VPC CNI outlived its instance**:
+
+```text
+eni-0f40584c111aad9f3   available   aws-K8S-i-04a43fa47de55c436
+```
+
+The instance was gone; the interface was detached but still present, still referencing the node
+security group. That blocks the security group, which blocks the subnet, which blocks the VPC.
+
+**Why the ordered teardown did not prevent it:** it addresses instances Karpenter owns and Terraform
+does not. This ENI belongs to the **VPC CNI**, which is a different lifecycle — the interface can
+survive its instance when the two teardowns interleave. Draining NodeClaims first is necessary and
+does not cover it.
+
+Check for it, and clear it if present:
 
 ```bash
-aws ec2 describe-instances --filters "Name=tag:karpenter.sh/nodepool,Values=*" \
-  "Name=instance-state-name,Values=running" --query 'length(Reservations)'
+VPC=$(terraform output -raw vpc_id)
+
+aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC" \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,Status,Description]' --output text
+
+# any 'available' interface left behind is an orphan; delete it, then re-run destroy
+aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=$VPC" \
+  "Name=status,Values=available" --query 'NetworkInterfaces[].NetworkInterfaceId' --output text \
+  | xargs -n1 -r aws ec2 delete-network-interface --network-interface-id
+
+terraform destroy
+```
+
+### Then verify, rather than assume
+
+```bash
+terraform state list | wc -l                                    # 0
+aws eks list-clusters --query 'length(clusters)'                 # 0
+aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" \
+  --query 'length(Reservations[].Instances[])'                   # 0
 aws ec2 describe-nat-gateways --filter "Name=state,Values=available" --query 'length(NatGateways)'
 aws ec2 describe-volumes --filters "Name=status,Values=available" --query 'length(Volumes)'
 aws ec2 describe-addresses --query 'length(Addresses)'
+aws ec2 describe-vpcs --filters "Name=tag:Project,Values=opsfleet-poc" --query 'length(Vpcs)'
 ```
 
-All should return `0` for resources belonging to this stack. Orphaned EBS volumes and Elastic IPs
-are the classic post-teardown bill.
+**This step is the deliverable, not a formality.** On the first teardown, Terraform printed an error
+and the orphan was obvious. With slightly different timing it could have printed `Destroy complete`
+with that ENI still holding a security group — and "it destroyed cleanly" would have been a claim
+rather than a fact. Orphaned EBS volumes and Elastic IPs are the same story with a monthly bill
+attached.
+
+**Not removed by `terraform destroy`, deliberately:** `AWSServiceRoleForEC2Spot`, from
+[Prerequisites](#one-account-level-prerequisite). It is account-global rather than stack-scoped, and
+deleting it would break Spot for everything else in the account.
 
 ---
 

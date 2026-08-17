@@ -47,7 +47,20 @@ provider "helm" {
     exec = {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
-      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
+
+      # --output json is not redundant. The exec plugin expects an
+      # ExecCredential object on stdout, and the AWS CLI honours whatever
+      # `output` the operator's profile sets. With `output = table` — a
+      # perfectly ordinary setting — `aws eks get-token` prints an ASCII table
+      # and the provider fails with:
+      #
+      #   Kubernetes cluster unreachable: getting credentials: decoding stdout:
+      #   couldn't get version/kind; json parse error
+      #
+      # which points at the cluster rather than at a CLI setting. Forcing the
+      # format here makes the configuration independent of the operator's
+      # profile, which is what "reproducible on someone else's machine" means.
+      args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region, "--output", "json"]
     }
   }
 }
