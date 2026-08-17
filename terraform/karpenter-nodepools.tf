@@ -35,6 +35,10 @@ resource "helm_release" "karpenter_resources" {
   })]
 
   # The CRDs ship with the Karpenter chart, so that release has to land first.
-  # module.eks for the same destroy-ordering reason as in karpenter.tf.
-  depends_on = [helm_release.karpenter, module.eks]
+  #
+  # module.eks and module.vpc for the destroy-ordering reason explained in
+  # karpenter.tf: removing *this* release is what deletes the EC2NodeClass, and
+  # its finalizer needs both a reachable API server and a working egress path to
+  # IAM before it will let go.
+  depends_on = [helm_release.karpenter, module.eks, module.vpc]
 }

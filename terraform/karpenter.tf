@@ -120,7 +120,19 @@ resource "helm_release" "karpenter" {
   #
   # depends_on creates the edge, and destroy reverses it: Helm is uninstalled
   # before anything touches the cluster.
-  depends_on = [module.karpenter, module.eks]
+  #
+  # module.vpc is the one that took two attempts to find. Uninstalling the
+  # release is not a Kubernetes-only operation: Karpenter's EC2NodeClass
+  # finalizer calls IAM to clean up the instance profile it created, and the
+  # controller runs in a private subnet. Destroy the NAT Gateway first and that
+  # call fails with `dial tcp … i/o timeout`, the finalizer is never removed,
+  # the object hangs in Terminating, and the uninstall fails — with an error
+  # that says nothing about networking.
+  #
+  # So the dependency is not "the cluster must outlive Helm". It is "everything
+  # the controller needs in order to shut down cleanly must outlive Helm",
+  # and that includes the egress path.
+  depends_on = [module.karpenter, module.eks, module.vpc]
 }
 
 # Chart defaults deliberately left alone, because they solve real problems:

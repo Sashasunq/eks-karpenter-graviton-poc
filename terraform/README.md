@@ -1,8 +1,9 @@
 # EKS + Karpenter proof of concept — Terraform
 
-> **Deployed and verified**, `eu-central-1`, 2026-08-17. Both architectures confirmed by `uname -m`,
-> Spot confirmed against the EC2 API, consolidation observed, teardown verified clean.
-> Results, and the five failures found on the way: [Run log](#run-log).
+> **Deployed and verified three times**, `eu-central-1`, 2026-08-17. Both architectures confirmed by
+> `uname -m`, Spot confirmed against the EC2 API, provisioning and consolidation observed live, and
+> the final run applied *and* destroyed in one pass each with nothing left behind.
+> Results, and the six failures found on the way: [Run log](#run-log).
 
 ---
 
@@ -42,6 +43,17 @@ headline capability, with the manifests and the commands.
 Applied to a real AWS account in `eu-central-1` on 2026-08-17, verified, and destroyed. Everything
 below is measured, not intended.
 
+### Three runs
+
+| | Run 1 | Run 2 | Run 3 |
+| --- | --- | --- | --- |
+| `terraform apply` | 3 attempts | **1 attempt**, 11m12s | **1 attempt**, 10m53s |
+| `terraform destroy` | 2 attempts + manual cleanup | 2 attempts + manual cleanup | **1 attempt**, 10m37s, nothing left |
+
+Runs 1 and 2 each exposed failures that were fixed in code. **Run 3 is the one that makes
+"reproducible" a measured claim rather than an intention** — apply and destroy both clean, no
+intervention, verified against AWS afterwards.
+
 ### Results
 
 | Phase | Result |
@@ -56,12 +68,14 @@ below is measured, not intended.
 | **ARM64 workload** | Node provisioned in **39s**, `c6g.large`, spot → **`uname -m` = `aarch64`** |
 | Spot, confirmed against AWS | `InstanceLifecycle: spot` on both, from `describe-instances` — not just the node label |
 | Consolidation | Empty node cordoned, drained and deleted **132s** after the workload went away |
-| Teardown | Ordered delete, then `terraform destroy`. Verified: 0 instances, 0 NAT gateways, 0 unattached volumes, 0 Elastic IPs, 0 VPCs |
+| Live provisioning test | Deleted the x86 workload → Karpenter removed the now-idle node after **191s**. Re-applied it → node provisioned and pod `Running` in **36s**, on a *different* instance type |
+| Instance-type diversity, observed | The x86 node came up as `c7i-flex.large`, `c8i-flex.large` and `c6a.large` across the three runs. Requirements are expressed as categories, so Karpenter picks what is cheap and available at that moment rather than waiting for a named type |
+| Teardown, run 3 | `Destroy complete! Resources: 81 destroyed` in one pass. Verified after: 0 Terraform resources, 0 clusters, 0 instances, 0 VPCs, 0 NAT gateways, **0 orphaned ENIs**, 0 volumes, 0 Elastic IPs, **0 instance profiles**, 0 log groups |
 
 ARM64 provisioned faster than x86 only because Karpenter's instance-type cache was already warm by
 then; it is not an architecture difference.
 
-### Five failures, and what they were
+### Six failures, and what they were
 
 None of these are findable by `terraform validate`, and every one of them is environment-dependent.
 That is the argument for running the thing rather than reading it — and for not trusting a default
@@ -159,6 +173,16 @@ implied the latter, and that has been corrected in [Cleanup](#cleanup).
 
 Deleting the orphan and re-running finished cleanly. What caught it was the post-destroy
 verification, not the destroy output.
+
+**6. Karpenter creates an instance profile that Terraform does not own.**
+
+When the finalizer above could not run, `opsfleet-poc_2517060924259259760` was left behind — an IAM
+instance profile **created by Karpenter, not by Terraform**. It is not in state, so `terraform
+destroy` does not know about it, and none of the usual post-teardown checks — instances, VPCs,
+volumes, addresses — would ever show it.
+
+Removed manually. The zero-check list now includes instance profiles, because a resource nobody
+looks for is a resource that stays.
 
 ### Graviton on Spot is not 20% cheaper
 
