@@ -3,7 +3,7 @@
 > **Deployed and verified three times**, `eu-central-1`, 2026-08-17. Both architectures confirmed by
 > `uname -m`, Spot confirmed against the EC2 API, provisioning and consolidation observed live, and
 > the final run applied *and* destroyed in one pass each with nothing left behind.
-> Results, and the six failures found on the way: [Run log](#run-log).
+> Results, and the six things that go wrong on the way: [Run log](#run-log).
 
 ---
 
@@ -75,114 +75,92 @@ intervention, verified against AWS afterwards.
 ARM64 provisioned faster than x86 only because Karpenter's instance-type cache was already warm by
 then; it is not an architecture difference.
 
-### Six failures, and what they were
+### What will go wrong, and what it actually is
 
-None of these are findable by `terraform validate`, and every one of them is environment-dependent.
-That is the argument for running the thing rather than reading it — and for not trusting a default
-region, a default profile or a default account to be representative.
+Building this against a real AWS account surfaces a set of failures that no amount of
+`terraform validate` will show you, because **not one of them is a configuration error**. Every one
+depends on the environment instead: which region you are in, how your AWS CLI happens to be
+configured, how old the account is, and how the platform behaves on the way down.
 
-**1. Karpenter's IAM policy does not fit — and whether it fits depends on the region's name.**
+Each was met during three full apply/destroy cycles. They are written as *what to expect* rather
+than as a diary, because that is the form in which they are useful — anyone repeating this exercise
+will meet the same list.
 
-```text
-LimitExceeded: Cannot exceed quota for PolicySize: 6144
-```
+---
 
-Measured from state: the rendered policy is **6218 characters, over the managed-policy limit by 74**.
-The region name appears in it **32 times**, so:
+**1. The Karpenter IAM policy may not fit, and whether it fits depends on how long your region's name is.**
 
-| Region | Policy size | |
-| --- | --- | --- |
-| `us-east-1` | 6122 | fits, by 22 characters |
-| `eu-west-1` | 6122 | fits |
-| **`eu-central-1`** | **6218** | **fails by 74** |
-| `ap-southeast-1` | 6282 | fails by 138 |
+| | |
+| --- | --- |
+| You see | `LimitExceeded: Cannot exceed quota for PolicySize: 6144` |
+| It actually is | The rendered policy is 6218 characters. The region name appears in it **32 times** |
+| Why it is not obvious | It works in `us-east-1` — by 22 characters. `eu-central-1` is three characters longer per occurrence and fails by 74. `ap-southeast-1` fails by 138 |
+| Fix | `enable_inline_policy = true`. Inline role policies are capped at 10240 rather than 6144 |
 
-The same configuration works in `us-east-1` and fails in `eu-central-1` because the region's name is
-three characters longer. Fixed with `enable_inline_policy = true` — an inline role policy is capped
-at 10240 instead of 6144. **A `us-east-1` default would have hidden this until someone deployed to
-Europe.**
+The module ships a variable whose description names this exact error, so it is well known — and it is
+off by default. **Anyone who develops in `us-east-1` and deploys elsewhere meets this in the other
+environment, not in theirs.**
 
-**2. The exec plugin depends on the operator's AWS CLI output format.**
+**2. The Helm provider cannot log in, because of a setting in your AWS CLI profile.**
 
-```text
-Kubernetes cluster unreachable: getting credentials: decoding stdout:
-couldn't get version/kind; json parse error
-```
+| | |
+| --- | --- |
+| You see | `Kubernetes cluster unreachable: getting credentials: decoding stdout: couldn't get version/kind; json parse error` |
+| It actually is | Your profile has `output = table`, so `aws eks get-token` printed an ASCII table where an `ExecCredential` object was expected |
+| Why it is not obvious | The message names the cluster. The cluster is fine |
+| Fix | `--output json` in the exec args, so the configuration stops depending on someone else's `~/.aws/config` |
 
-The message points at the cluster. The cause is that the profile had `output = table`, so
-`aws eks get-token` printed an ASCII table instead of an `ExecCredential` object. Fixed by adding
-`--output json` to the exec args, so the configuration no longer depends on a setting in someone
-else's `~/.aws/config`.
+**3. A new AWS account cannot launch Spot at all.**
 
-**3. A brand-new AWS account cannot launch Spot at all.**
+| | |
+| --- | --- |
+| You see | `UnfulfillableCapacity` from `CreateFleet`, then `nodepool requirements filtered out all instance types`, repeatedly |
+| It actually is | `AuthFailure.ServiceLinkedRoleCreationNotPermitted`, nested *inside* the first error. `AWSServiceRoleForEC2Spot` does not exist and Karpenter cannot create it |
+| Why it is not obvious | The follow-on message is what appears *after* a failed launch, because Karpenter caches those instance types as unavailable. Read the top line only and you will go and rewrite your NodePool. The requirements were fine — 42 instance types matched |
+| Fix | `aws iam create-service-linked-role --aws-service-name spot.amazonaws.com`, once per account. See [Prerequisites](#one-account-level-prerequisite) |
 
-```text
-AuthFailure.ServiceLinkedRoleCreationNotPermitted: The provided credentials do not have
-permission to create the service-linked role for EC2 Spot Instances.
-```
+**4. `terraform destroy` will tear the cluster down while Helm is still uninstalling.**
 
-wrapped inside an `UnfulfillableCapacity` from `CreateFleet`, and followed by repeated
-`nodepool requirements filtered out all instance types` — which is what you see *after* a failed
-launch, because Karpenter caches the types as temporarily unavailable. Read only the top line and
-you go and rewrite the NodePool. The requirements were fine: Karpenter had matched **42 instance
-types**.
+| | |
+| --- | --- |
+| You see | `Error: Error uninstalling release`. Running destroy again appears to fix it |
+| It actually is | The Helm provider reaches the cluster through values read from `module.eks`, but **a provider-level dependency is not an edge in Terraform's resource graph**, so destroy is free to run both concurrently |
+| Why it is not obvious | It looks transient, because a retry gets further |
+| Fix | Explicit `depends_on` from the releases to the cluster |
 
-The account was missing `AWSServiceRoleForEC2Spot`. One command, once per account:
+**And the fix has to be wider than that, which is the part worth knowing.** Uninstalling the release
+is not a Kubernetes-only operation: the `EC2NodeClass` finalizer calls IAM to clean up the instance
+profile Karpenter created, and the controller sits in a private subnet. Remove the NAT gateway first
+and that call times out, the finalizer never releases, the object hangs in `Terminating`, and the
+uninstall fails — with an error that says nothing about networking.
 
-```bash
-aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
-```
+So the dependency is not *"the cluster must outlive Helm"*. It is **"everything the controller needs
+in order to shut down cleanly must outlive Helm"**, and that includes the egress path.
 
-See [Prerequisites](#one-account-level-prerequisite).
+**5. A VPC CNI network interface will outlive its instance and block the entire VPC.**
 
-**4. `terraform destroy` tore the cluster down while Helm was still uninstalling.**
+| | |
+| --- | --- |
+| You see | `DependencyViolation: resource sg-… has a dependent object`, and destroy stops with the VPC still alive |
+| It actually is | A secondary ENI created by the VPC CNI, `available` but still referencing the node security group. ENI blocks security group, which blocks subnet, which blocks VPC |
+| Why it is not obvious | The ordered teardown *worked* — every NodeClaim drained before Terraform ran. But that addresses instances **Karpenter** owns and Terraform does not; this interface belongs to a different lifecycle |
+| Fix | Delete the orphan, re-run destroy. The check is in [Cleanup](#cleanup) |
 
-```text
-Error: Error uninstalling release
-```
+**6. Karpenter creates an IAM instance profile that Terraform does not own.**
 
-The Helm provider reaches the cluster through values read from `module.eks` — but a **provider-level
-dependency is not an edge in Terraform's resource graph.** With default parallelism, destroy started
-removing EKS resources concurrently with the Helm uninstall, and the uninstall failed once the API
-server was unreachable. Re-running finished the job, which is the worst kind of bug: it looks
-transient.
+| | |
+| --- | --- |
+| You see | Nothing. That is the problem |
+| It actually is | Karpenter creates its own instance profile. It is not in state, so `terraform destroy` cannot remove it, and the usual post-teardown checks — instances, VPCs, volumes, addresses — will never show it |
+| Why it is not obvious | Every other resource is accounted for, so the teardown looks clean |
+| Fix | Include instance profiles in the verification list. A resource nobody looks for is a resource that stays |
 
-Fixed with an explicit `depends_on = [module.eks]` on both releases, which creates the edge; destroy
-reverses it and uninstalls Helm first.
+---
 
-**This is empirical evidence for the boundary this POC deliberately relaxed.** In production the
-chart and the NodePools would belong to a GitOps controller, and "destroy the cluster" and "remove
-what is inside the cluster" would not be two halves of one dependency graph. The cost of relaxing it
-was documented here as a plan-time inconvenience; it is actually a destroy-time correctness problem.
-
-**5. A VPC CNI ENI outlived its instance and blocked the whole VPC.**
-
-```text
-Error: deleting Security Group (sg-…): DependencyViolation: resource has a dependent object
-eni-0f40584c111aad9f3   available   aws-K8S-i-04a43fa47de55c436
-```
-
-The ordered teardown did its job — both NodeClaims drained and `kubectl get nodeclaims` returned
-`No resources found` before Terraform ran. But a **secondary ENI created by the VPC CNI** survived
-the instance it belonged to, still referencing the node security group: ENI blocks security group,
-which blocks subnet, which blocks VPC.
-
-The ordered teardown addresses instances *Karpenter* owns and Terraform does not. This interface
-belongs to a different lifecycle. **Necessary, and not sufficient** — the README said the former and
-implied the latter, and that has been corrected in [Cleanup](#cleanup).
-
-Deleting the orphan and re-running finished cleanly. What caught it was the post-destroy
-verification, not the destroy output.
-
-**6. Karpenter creates an instance profile that Terraform does not own.**
-
-When the finalizer above could not run, `opsfleet-poc_2517060924259259760` was left behind — an IAM
-instance profile **created by Karpenter, not by Terraform**. It is not in state, so `terraform
-destroy` does not know about it, and none of the usual post-teardown checks — instances, VPCs,
-volumes, addresses — would ever show it.
-
-Removed manually. The zero-check list now includes instance profiles, because a resource nobody
-looks for is a resource that stays.
+**The pattern across all six:** the loudest error was rarely the cause. In three of them the real
+message was nested inside another one, or pointed at a component that was healthy. That is worth
+more as a habit than any individual fix — **read past the first line, and check what the failing
+component was actually trying to do.**
 
 ### Graviton on Spot is not 20% cheaper
 
