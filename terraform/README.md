@@ -18,6 +18,9 @@ on either architecture.
 The goal is not the largest possible cluster. It is a small one where every decision is visible and
 every claim is checkable.
 
+**→ [Scheduling workloads on x86_64 and ARM64](#scheduling-workloads-on-x86_64-and-arm64)** — the
+headline capability, with the manifests and the commands.
+
 ---
 
 ## Current scope
@@ -176,6 +179,120 @@ value literally.
 | `az_count` | `3` | Clamped to the zones the region actually has |
 | `endpoint_public_access` | `true` | See [Cluster access](#cluster-access) |
 | `single_nat_gateway` | `true` | Set `false` for one NAT per AZ — see [Cost](#cost) |
+
+---
+
+## Scheduling workloads on x86_64 and ARM64
+
+The contract, in one sentence:
+
+> **A pod requests an architecture. Karpenter picks an instance type that satisfies it.
+> A workload manifest never names an instance type.**
+
+Two NodePools exist — `x86-spot` and `arm64-spot`. They are identical apart from one requirement,
+and you never reference them by name: the scheduler matches on the well-known
+`kubernetes.io/arch` label, and Karpenter provisions from whichever pool can satisfy the pod.
+
+### Deploy to x86_64
+
+```yaml
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64      # ← the only line that decides this
+```
+
+```bash
+kubectl apply -f examples/x86-deployment.yaml
+kubectl exec deploy/demo-x86 -- uname -m        # x86_64
+```
+
+### Deploy to ARM64 / Graviton
+
+```yaml
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64      # ← and this one
+```
+
+```bash
+kubectl apply -f examples/arm64-deployment.yaml
+kubectl exec deploy/demo-arm64 -- uname -m      # aarch64
+```
+
+`examples/arm64-deployment.yaml` is byte-identical to `examples/x86-deployment.yaml` apart from the
+resource name and that one word. **That is the honest summary of Graviton adoption at the cluster
+level: it is a scheduling change.**
+
+### Let Karpenter choose
+
+Most workloads should say "either" once their image supports it, and let the provisioner decide on
+price and availability. `nodeSelector` cannot express that, so this uses `nodeAffinity`:
+
+```yaml
+spec:
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64", "arm64"]
+```
+
+```bash
+kubectl apply -f examples/multi-arch-deployment.yaml
+```
+
+### A third option, when a platform team owns placement
+
+Both NodePools also label their nodes `workload-arch: x86` / `workload-arch: graviton`. Selecting on
+a custom label instead of `kubernetes.io/arch` decouples the workload from the well-known key, which
+is useful when the platform team wants to change placement policy without editing every manifest.
+Mentioned because it exists; `kubernetes.io/arch` is the right default.
+
+### The part that actually takes work
+
+**The cluster side of ARM adoption is one line. The image side is the migration.**
+
+The container image must have a `linux/arm64` variant — which means every dependency, including
+native extensions and vendored binaries, must exist for ARM:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t <repo>:<tag> --push .
+docker manifest inspect <image>        # confirm both architectures before deploying
+```
+
+Get it wrong and the pod crash-loops with `exec format error` — which reads like a broken image
+rather than a missing architecture, and is the most common way an ARM rollout fails.
+
+The demo image here (`public.ecr.aws/amazonlinux/amazonlinux:2023`) was checked against the registry
+API for both architectures *before* these manifests were written, for exactly that reason.
+
+### Proving where a pod actually landed
+
+```bash
+kubectl get nodes -L kubernetes.io/arch,karpenter.sh/capacity-type,node.kubernetes.io/instance-type
+```
+
+**`uname -m` is the proof, not the node label.** A label reports what Karpenter believes; `uname`
+reports what the kernel is running on. And for capacity type, ask AWS rather than the cluster:
+
+```bash
+aws ec2 describe-instances \
+  --filters "Name=tag:karpenter.sh/nodepool,Values=*" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].[InstanceType,InstanceLifecycle,Placement.AvailabilityZone]' \
+  --output table
+```
+
+`InstanceLifecycle: spot` from the EC2 API is independent confirmation of the
+`karpenter.sh/capacity-type=spot` label.
 
 ---
 
@@ -499,23 +616,26 @@ management fee.
 
 ## Planning before the cluster exists
 
-The Helm provider is configured from the EKS cluster this same configuration creates. On a **cold
-run**, before any of it exists, the cluster endpoint and CA data are unknown at plan time.
+The Helm provider is configured from the EKS cluster this same configuration creates, so on a cold
+run its `host` and `cluster_ca_certificate` are unknown at plan time. That is often assumed to
+require a two-stage `-target` bootstrap.
 
-This is a property of putting an in-cluster resource and the cluster in one configuration, not a
-defect, and it is not worked around by hard-coding an endpoint — that would trade a visible
-inconvenience for an invisible staleness bug.
+**It does not, and this was measured rather than assumed.** A cold plan against an empty account
+resolves the whole configuration in one pass:
 
-If a cold `terraform plan` cannot resolve the Helm release, apply the AWS layer first and then the
-whole configuration:
-
-```bash
-terraform apply -target=module.vpc -target=module.eks -target=module.karpenter
-terraform apply
+```text
+Plan: 82 to add, 0 to change, 0 to destroy.
 ```
 
-`-target` is a deliberate two-stage bootstrap here, not a way of avoiding a problem. On every
-subsequent run the cluster already exists and a plain `plan` resolves everything.
+Both `helm_release.karpenter` and `helm_release.karpenter_resources` are in that plan.
+
+The reason is worth knowing: with no state there are no Helm releases to refresh, so the provider is
+never actually configured during plan — unknown values in a provider block only matter when the
+provider has to be used. On later runs the cluster exists and the values are known, so the question
+never arises again.
+
+**No `-target` is needed at any point.** Hard-coding an endpoint to work around a problem that does
+not occur would trade a visible inconvenience for an invisible staleness bug.
 
 **In production this would not arise**, because the boundary would be drawn differently: Terraform
 would own the AWS resources and a GitOps controller would own everything inside the cluster. That
